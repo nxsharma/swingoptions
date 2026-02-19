@@ -1,0 +1,87 @@
+//@version=5
+strategy("Swing Options: 7D High + Weekly Div", overlay=true, initial_capital=10000)
+
+// --- 1. SETTINGS INPUTS ---
+grp1 = "Time Settings"
+is_time_filtered = input.bool(true, "Enable Time Filter?", group=grp1)
+start_time = input.string("0930", "Start Time (HHMM)", group=grp1)
+end_time   = input.string("1130", "End Time (HHMM)", group=grp1)
+
+grp2 = "Volume Thresholds"
+call_vol_mult = input.float(1.0, "Call Volume Multiplier", minval=0.1, step=0.1, group=grp2)
+put_vol_mult  = input.float(0.85, "Put Volume Multiplier", minval=0.1, step=0.1, group=grp2)
+
+grp3 = "Weekly RSI Divergence"
+use_weekly_div = input.bool(true, "Require Weekly Bearish Div for Puts?", group=grp3)
+rsi_len = input.int(14, "RSI Length", group=grp3)
+
+grp4 = "Moving Averages"
+len_fast = input.int(5, "Fast SMA (5)", group=grp4)
+len_med  = input.int(9, "Medium SMA (9)", group=grp4)
+len_slow = input.int(50, "Slow SMA (50)", group=grp4)
+
+grp5 = "VWAP Setting"
+use_vwap = input.bool(true, "Use VWAP Filter?", group=grp5)
+
+// --- 2. Indicators & Weekly Logic ---
+is_in_time = is_time_filtered ? not na(time(timeframe.period, start_time + "-" + end_time)) : true
+
+sma5  = ta.sma(close, len_fast)
+sma9  = ta.sma(close, len_med)
+sma50 = ta.sma(close, len_slow)
+vol_avg = ta.sma(volume, 20)
+atr = ta.atr(14)
+vwap_val = ta.vwap(close)
+
+// Fetch Weekly RSI Data
+w_rsi = request.security(syminfo.tickerid, "W", ta.rsi(close, rsi_len))
+w_high = request.security(syminfo.tickerid, "W", high)
+
+// Weekly Bearish Divergence: Price makes higher high, RSI makes lower high
+w_bear_div = (w_high > w_high[1]) and (w_rsi < w_rsi[1])
+
+// --- 3. 7-Day High Logic ---
+seven_day_high = request.security(syminfo.tickerid, "D", ta.highest(high, 7)[1])
+
+// --- 4. Call Logic ---
+high_vol_call = volume > (vol_avg * call_vol_mult)
+is_sloping_up = sma50 > sma50[5]
+mom_stack_up = close > sma5 and sma5 > sma9
+// VWAP Check for Calls
+vwap_call_check = use_vwap ? close > vwap_val : true
+
+long_trigger = ta.crossover(close, sma50) and is_sloping_up and close > seven_day_high and mom_stack_up and is_in_time and high_vol_call and vwap_call_check
+
+// --- 5. Put Logic ---
+is_sloping_down = sma50 < sma50[5]
+eased_vol_put = volume > (vol_avg * put_vol_mult)
+mom_stack_down = close < sma5 and sma5 < sma9
+// VWAP Check for Puts
+vwap_put_check = use_vwap ? close < vwap_val : true
+div_check = use_weekly_div ? w_bear_div : true
+
+short_trigger = ta.crossunder(close, sma50) and is_sloping_down and close < open and is_in_time and eased_vol_put and div_check and vwap_put_check
+
+// Momentum Override
+is_high_momentum = math.abs(close - open) > (ta.sma(math.abs(close[1] - open[1]), 20) * 1.8)
+mom_short = ta.crossunder(close, sma50) and is_high_momentum and close < open and vwap_put_check
+
+// --- 6. Execution ---
+if (long_trigger)
+    strategy.entry("Call", strategy.long)
+
+if (short_trigger or mom_short)
+    strategy.entry("Put", strategy.short)
+
+// Trailing Stops
+if (strategy.position_size > 0)
+    strategy.exit("Ex Call", "Call", stop=ta.highest(high, 3) - (atr * 1.5))
+if (strategy.position_size < 0)
+    strategy.exit("Ex Put", "Put", stop=ta.lowest(low, 3) + (atr * 1.5))
+
+// --- 7. Visuals ---
+plot(sma50, color=is_sloping_up ? color.green : color.red, linewidth=2, title="50 SMA")
+plot(vwap_val, color=color.gray, style=plot.style_circles, title="VWAP")
+plotshape(long_trigger, "Call", shape.labelup, location.belowbar, color.green, text="7D CALL")
+plotshape(short_trigger, "Put", shape.labeldown, location.abovebar, color.red, text="DIV PUT")
+bgcolor(use_weekly_div and w_bear_div ? color.new(color.orange, 90) : na)
