@@ -1,5 +1,5 @@
 //@version=5
-strategy("Swing Options: 7D High + Weekly Div", overlay=true, initial_capital=10000)
+strategy("Swing Options: 7D High + Weekly Div", overlay=true, initial_capital=10000, max_bars_back=5000)
 
 // --- 1. SETTINGS INPUTS ---
 grp1 = "Time Settings"
@@ -11,52 +11,64 @@ grp2 = "Volume Thresholds"
 call_vol_mult = input.float(1.0, "Call Volume Multiplier", minval=0.1, step=0.1, group=grp2)
 put_vol_mult  = input.float(0.85, "Put Volume Multiplier", minval=0.1, step=0.1, group=grp2)
 
-grp3 = "Weekly RSI Divergence"
+grp3 = "Divergence Indicators"
 use_weekly_div = input.bool(true, "Require Weekly Bearish Div for Puts?", group=grp3)
+use_daily_div  = input.bool(true, "Show Daily Bearish Div Signals?", group=grp3)
 rsi_len = input.int(14, "RSI Length", group=grp3)
 
 grp4 = "Moving Averages"
-len_fast = input.int(5, "Fast SMA (5)", group=grp4)
-len_med  = input.int(9, "Medium SMA (9)", group=grp4)
-len_slow = input.int(50, "Slow SMA (50)", group=grp4)
+len_fast   = input.int(5, "Fast SMA (5)", group=grp4)
+len_med    = input.int(9, "Medium SMA (9)", group=grp4)
+len_ema    = input.int(20, "EMA Length (20)", group=grp4)
+len_slow   = input.int(50, "Slow SMA (50)", group=grp4)
+len_100    = input.int(100, "100 MA Length", group=grp4)
 
-grp5 = "VWAP Setting"
+grp5 = "Safety Filters"
 use_vwap = input.bool(true, "Use VWAP Filter?", group=grp5)
+max_ext_enabled = input.bool(true, "Prevent Buying if too far from 100 MA?", group=grp5)
+max_ext_pct = input.float(5.0, "Max Extension % from 100 MA", minval=0.1, step=0.5, group=grp5)
 
-// --- 2. Indicators & Weekly Logic ---
+// --- 2. Indicators & Weekly/Daily Logic ---
 is_in_time = is_time_filtered ? not na(time(timeframe.period, start_time + "-" + end_time)) : true
 
 sma5  = ta.sma(close, len_fast)
 sma9  = ta.sma(close, len_med)
+ema20 = ta.ema(close, len_ema)
 sma50 = ta.sma(close, len_slow)
+ma100 = ta.sma(close, len_100)
 vol_avg = ta.sma(volume, 20)
 atr = ta.atr(14)
 vwap_val = ta.vwap(close)
 
-// Fetch Weekly RSI Data
-w_rsi = request.security(syminfo.tickerid, "W", ta.rsi(close, rsi_len))
-w_high = request.security(syminfo.tickerid, "W", high)
+// Extension Calculation
+dist_from_100 = ((close - ma100) / ma100) * 100
+is_not_overextended = max_ext_enabled ? dist_from_100 < max_ext_pct : true
 
-// Weekly Bearish Divergence: Price makes higher high, RSI makes lower high
+// Fetch Weekly Data (RSI)
+w_rsi = request.security(syminfo.tickerid, "W", ta.rsi(close, rsi_len), lookahead=barmerge.lookahead_on)
+w_high = request.security(syminfo.tickerid, "W", high, lookahead=barmerge.lookahead_on)
 w_bear_div = (w_high > w_high[1]) and (w_rsi < w_rsi[1])
 
+// Fetch Daily Data (RSI)
+d_rsi = request.security(syminfo.tickerid, "D", ta.rsi(close, rsi_len), lookahead=barmerge.lookahead_on)
+d_high = request.security(syminfo.tickerid, "D", high, lookahead=barmerge.lookahead_on)
+d_bear_div = (d_high > d_high[1]) and (d_rsi < d_rsi[1])
+
 // --- 3. 7-Day High Logic ---
-seven_day_high = request.security(syminfo.tickerid, "D", ta.highest(high, 7)[1])
+seven_day_high = request.security(syminfo.tickerid, "D", ta.highest(high, 7)[1], lookahead=barmerge.lookahead_on)
 
 // --- 4. Call Logic ---
 high_vol_call = volume > (vol_avg * call_vol_mult)
 is_sloping_up = sma50 > sma50[5]
 mom_stack_up = close > sma5 and sma5 > sma9
-// VWAP Check for Calls
 vwap_call_check = use_vwap ? close > vwap_val : true
 
-long_trigger = ta.crossover(close, sma50) and is_sloping_up and close > seven_day_high and mom_stack_up and is_in_time and high_vol_call and vwap_call_check
+long_trigger = ta.crossover(close, sma50) and is_sloping_up and close > seven_day_high and mom_stack_up and is_in_time and high_vol_call and vwap_call_check and is_not_overextended
 
 // --- 5. Put Logic ---
 is_sloping_down = sma50 < sma50[5]
 eased_vol_put = volume > (vol_avg * put_vol_mult)
 mom_stack_down = close < sma5 and sma5 < sma9
-// VWAP Check for Puts
 vwap_put_check = use_vwap ? close < vwap_val : true
 div_check = use_weekly_div ? w_bear_div : true
 
@@ -73,15 +85,65 @@ if (long_trigger)
 if (short_trigger or mom_short)
     strategy.entry("Put", strategy.short)
 
-// Trailing Stops
-if (strategy.position_size > 0)
-    strategy.exit("Ex Call", "Call", stop=ta.highest(high, 3) - (atr * 1.5))
-if (strategy.position_size < 0)
-    strategy.exit("Ex Put", "Put", stop=ta.lowest(low, 3) + (atr * 1.5))
-
 // --- 7. Visuals ---
 plot(sma50, color=is_sloping_up ? color.green : color.red, linewidth=2, title="50 SMA")
+plot(ema20, color=color.purple, linewidth=1, title="20 EMA")
+plot(ma100, color=color.blue, linewidth=2, title="100 MA")
 plot(vwap_val, color=color.gray, style=plot.style_circles, title="VWAP")
-plotshape(long_trigger, "Call", shape.labelup, location.belowbar, color.green, text="7D CALL")
-plotshape(short_trigger, "Put", shape.labeldown, location.abovebar, color.red, text="DIV PUT")
-bgcolor(use_weekly_div and w_bear_div ? color.new(color.orange, 90) : na)
+
+plotshape(long_trigger, "Call Signal", shape.labelup, location.belowbar, color.green, size=size.small, text="7D CALL")
+plotshape(short_trigger or mom_short, "Put Signal", shape.labeldown, location.abovebar, color.red, size=size.small, text="PUT")
+plotshape(use_daily_div and d_bear_div, "Daily Div", shape.diamond, location.abovebar, color.orange, size=size.tiny, text="D-DIV")
+
+bgcolor(max_ext_enabled and dist_from_100 >= max_ext_pct ? color.new(color.red, 90) : na, title="Overextended Warning")
+bgcolor(use_weekly_div and w_bear_div ? color.new(color.orange, 90) : na, title="Weekly Bear Div")
+
+// --- 8. One-Time 10-Minute Confirmation Alert (Upside & Downside) ---
+// Note: 9:00 AM CST is 10:00 AM EST (TradingView default exchange time for many tickers)
+// We calculate 10 minutes as 600,000 milliseconds.
+
+var bool daily_up_fired = false
+var bool daily_down_fired = false
+if ta.change(time("D"))
+    daily_up_fired := false
+    daily_down_fired := false
+
+after_9am_cst = hour(time, "America/Chicago") >= 9
+
+// Upside Logic
+var float up_start_time = na
+above_confirm = close > vwap_val and close > ema20
+if not above_confirm
+    up_start_time := na
+else if above_confirm and na(up_start_time)
+    up_start_time := time
+
+ten_min_up_complete = not na(up_start_time) and (time_close - up_start_time) >= 600000
+trigger_up_alert = after_9am_cst and ten_min_up_complete and not daily_up_fired
+
+if trigger_up_alert
+    daily_up_fired := true
+
+// Downside Logic
+var float down_start_time = na
+below_confirm = close < vwap_val and close < ema20
+if not below_confirm
+    down_start_time := na
+else if below_confirm and na(down_start_time)
+    down_start_time := time
+
+ten_min_down_complete = not na(down_start_time) and (time_close - down_start_time) >= 600000
+trigger_down_alert = after_9am_cst and ten_min_down_complete and not daily_down_fired
+
+if trigger_down_alert
+    daily_down_fired := true
+
+// Visual Markers for the One-Time Alerts
+plotshape(trigger_up_alert, "10m Upside Confirm", shape.triangleup, location.top, color.blue, size=size.small, text="10M UP")
+plotshape(trigger_down_alert, "10m Downside Confirm", shape.triangledown, location.top, color.orange, size=size.small, text="10M DOWN")
+
+// Alert Conditions
+alertcondition(long_trigger, title="Call Alert", message="7-Day High Breakout + 5/9 Stack")
+alertcondition(short_trigger or mom_short, title="Put Alert", message="Bearish Divergence + 50 SMA Crossunder")
+alertcondition(trigger_up_alert, title="One-Time 10m Up Alert", message="Price held above VWAP/EMA20 for 10 mins (Daily One-Time)")
+alertcondition(trigger_down_alert, title="One-Time 10m Down Alert", message="Price held below VWAP/EMA20 for 10 mins (Daily One-Time)")
